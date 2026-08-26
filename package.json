@@ -1,0 +1,17 @@
+{
+  "name": "stark-preview-helper",
+  "version": "0.3.0",
+  "private": true,
+  "description": "A local Node process controlled by Stark's web app — opens sites and loads generated Chrome extensions into a real, self-provisioned Chrome for Testing browser for genuine, native preview.",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "setup": "node install.js"
+  },
+  "dependencies": {
+    "@puppeteer/browsers": "^3.0.6",
+    "extract-zip": "^2.0.1",
+    "puppeteer-core": "^25.4.0",
+    "ws": "^8.18.0"
+  }
+}
