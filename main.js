@@ -42,7 +42,9 @@ const { WebSocketServer } = require("ws");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const os = require("node:os");
-const extractZip = require("extract-zip");
+const yauzl = require("yauzl");
+const fsSync = require("node:fs");
+const { pipeline } = require("node:stream/promises");
 
 const PORT = 17872;
 const CHROME_CACHE_DIR = path.join(os.homedir(), ".cache", "puppeteer");
@@ -144,6 +146,93 @@ async function ensureChromeInstalled() {
   }
 }
 
+/* ------------------------------ safe zip extraction ------------------------------ */
+
+// Replaces extract-zip, which has an unfixed symlink path-traversal flaw
+// (GHSA-jmr9-qjv8-65gv): a zip entry can be a symlink pointing anywhere on
+// disk, and a later entry writing "through" it lands outside the extraction
+// directory — i.e. arbitrary file write. extract-zip has no patched version,
+// so the fix is to stop using it. This does the same job on the same engine
+// (yauzl, which extract-zip itself wraps) with the two checks it's missing:
+// every path must stay inside the target directory, and symlinks are never
+// created at all. A Chrome extension is plain files — it has no legitimate
+// need for either.
+
+const S_IFMT = 0o170000;
+const S_IFLNK = 0o120000;
+
+function entryIsSymlink(entry) {
+  const mode = (entry.externalFileAttributes >>> 16) & 0xffff;
+  return (mode & S_IFMT) === S_IFLNK;
+}
+
+// Resolve an entry name under rootDir, refusing anything that escapes it —
+// absolute paths ("/etc/x"), drive paths ("C:\x"), and ../ traversal.
+function resolveInside(rootDir, entryName) {
+  if (path.isAbsolute(entryName) || /^[a-zA-Z]:/.test(entryName)) {
+    throw new Error(`Refusing zip entry with an absolute path: ${entryName}`);
+  }
+  const dest = path.resolve(rootDir, entryName);
+  const rel = path.relative(rootDir, dest);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`Refusing zip entry that escapes the extraction directory: ${entryName}`);
+  }
+  return dest;
+}
+
+async function safeExtractZip(zipPath, destDir) {
+  await fs.mkdir(destDir, { recursive: true });
+  const zipfile = await new Promise((resolve, reject) => {
+    yauzl.open(zipPath, { lazyEntries: true, autoClose: true }, (err, zf) =>
+      err ? reject(err) : resolve(zf),
+    );
+  });
+
+  await new Promise((resolve, reject) => {
+    const fail = (err) => {
+      try {
+        zipfile.close();
+      } catch {
+        // already closing
+      }
+      reject(err);
+    };
+
+    zipfile.on("error", fail);
+    zipfile.on("end", resolve);
+
+    zipfile.on("entry", (entry) => {
+      (async () => {
+        // Never materialize a symlink — this is the actual traversal vector.
+        if (entryIsSymlink(entry)) {
+          throw new Error(`Refusing symlink in extension zip: ${entry.fileName}`);
+        }
+
+        const isDir = entry.fileName.endsWith("/");
+        const dest = resolveInside(destDir, entry.fileName);
+
+        if (isDir) {
+          await fs.mkdir(dest, { recursive: true });
+          return;
+        }
+
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        const readStream = await new Promise((res, rej) => {
+          zipfile.openReadStream(entry, (err, rs) => (err ? rej(err) : res(rs)));
+        });
+        // 'wx' — never follow or overwrite something already there, so a
+        // duplicate entry can't be used to clobber an earlier one.
+        await pipeline(readStream, fsSync.createWriteStream(dest, { flags: "wx" }));
+      })().then(
+        () => zipfile.readEntry(),
+        (err) => fail(err),
+      );
+    });
+
+    zipfile.readEntry();
+  });
+}
+
 /* ------------------------------ browser lifecycle ------------------------------ */
 
 async function launchBrowser() {
@@ -196,7 +285,7 @@ async function loadExtension(zipBase64) {
   const zipPath = path.join(workDir, "ext.zip");
   await fs.writeFile(zipPath, buf);
   const extractDir = path.join(workDir, "unpacked");
-  await extractZip(zipPath, { dir: extractDir });
+  await safeExtractZip(zipPath, extractDir);
 
   if (loadedExtension) {
     const stale = loadedExtension;

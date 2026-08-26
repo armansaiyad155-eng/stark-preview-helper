@@ -10,8 +10,8 @@
   },
   "dependencies": {
     "@puppeteer/browsers": "^3.0.6",
-    "extract-zip": "^2.0.1",
     "puppeteer-core": "^25.4.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "yauzl": "^2.10.0"
   }
 }
