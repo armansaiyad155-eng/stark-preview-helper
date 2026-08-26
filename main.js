@@ -48,16 +48,53 @@ const PORT = 17872;
 const CHROME_CACHE_DIR = path.join(os.homedir(), ".cache", "puppeteer");
 const PROFILE_DIR = path.join(os.homedir(), ".stark-preview-chrome-profile");
 
+// Only ever bind the control server to loopback. Without an explicit host,
+// ws/Node listen on :: (ALL interfaces) — which put this port, and every
+// command below, in reach of anyone on the same LAN (shared office wifi, a
+// cafe, a compromised router). The Origin header below is NOT a second line
+// of defense against that: Origin is honest only when a real browser sets
+// it, and any non-browser client can forge it freely. Loopback-only is what
+// actually keeps remote machines out.
+const HOST = "127.0.0.1";
+
+// Note these are all https:// except localhost, and browsers block an
+// https:// page from opening an insecure ws:// connection — so in practice
+// only http://localhost can reach us today. They're kept for the day the
+// transport moves to wss://, and deliberately exclude wildcard third-party
+// hosting domains: `*.lovable.app` / `*.lovableproject.com` would have
+// trusted EVERY project any stranger deploys on those platforms, not just
+// Stark's own. Stark's Lovable address is a single known host.
 const TRUSTED_ORIGIN_PATTERNS = [
   /^http:\/\/localhost(:\d+)?$/,
+  /^http:\/\/127\.0\.0\.1(:\d+)?$/,
   /^https:\/\/usestark\.com$/,
-  /^https:\/\/[^/]+\.usestark\.com$/,
-  /^https:\/\/[^/]+\.lovable\.app$/,
-  /^https:\/\/[^/]+\.lovableproject\.com$/,
+  /^https:\/\/[^/.]+\.usestark\.com$/,
+  /^https:\/\/usestark\.lovable\.app$/,
 ];
 
 function isTrustedOrigin(origin) {
   return !!origin && TRUSTED_ORIGIN_PATTERNS.some((re) => re.test(origin));
+}
+
+// Anything that isn't a normal web page. file:// would turn "open a URL"
+// into "read any file on this machine and render it in a window an
+// attacker-supplied extension can read"; chrome:// reaches browser
+// internals. The helper only ever needs to open real sites.
+const ALLOWED_URL_PROTOCOLS = new Set(["http:", "https:"]);
+
+function assertSafeUrl(raw) {
+  if (typeof raw !== "string" || !raw) throw new Error("Missing url");
+  if (raw === "about:blank") return raw;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Invalid url");
+  }
+  if (!ALLOWED_URL_PROTOCOLS.has(parsed.protocol)) {
+    throw new Error(`Refusing to open ${parsed.protocol} url — only http/https are allowed.`);
+  }
+  return parsed.href;
 }
 
 let browser = null;
@@ -140,8 +177,9 @@ async function launchBrowser() {
 /* ------------------------------- commands ------------------------------- */
 
 async function openUrl(url) {
+  const safeUrl = assertSafeUrl(url);
   await browserReady;
-  await page.goto(url, { waitUntil: "load" });
+  await page.goto(safeUrl, { waitUntil: "load" });
   return { ok: true };
 }
 
@@ -161,11 +199,17 @@ async function loadExtension(zipBase64) {
   await extractZip(zipPath, { dir: extractDir });
 
   if (loadedExtension) {
+    const stale = loadedExtension;
     try {
-      await browser.uninstallExtension(loadedExtension.id);
+      await browser.uninstallExtension(stale.id);
     } catch (err) {
       console.error("[Stark Preview Helper] uninstallExtension failed:", err?.message || err);
     }
+    // Only safe to delete once Chrome has let go of it — every previous
+    // preview otherwise left a full unpacked copy in the temp dir forever.
+    await fs.rm(stale.workDir, { recursive: true, force: true }).catch((err) => {
+      console.error("[Stark Preview Helper] temp cleanup failed:", err?.message || err);
+    });
     loadedExtension = null;
   }
 
@@ -178,7 +222,7 @@ async function loadExtension(zipBase64) {
   const popupPath = manifest.action?.default_popup || manifest.browser_action?.default_popup || null;
   const name = info?.name || manifest.name || "Extension";
 
-  loadedExtension = { id, name, dir: extractDir };
+  loadedExtension = { id, name, dir: extractDir, workDir };
 
   // Content scripts only inject on load, so reload whatever's open to give
   // them a chance to run — same as reloading a tab after installing in
@@ -225,7 +269,7 @@ function startControlServer() {
   return new Promise((resolve, reject) => {
     let wss;
     try {
-      wss = new WebSocketServer({ port: PORT });
+      wss = new WebSocketServer({ port: PORT, host: HOST });
     } catch (err) {
       reject(err);
       return;
@@ -272,7 +316,7 @@ function startControlServer() {
       }
     });
     });
-    console.log(`[Stark Preview Helper] control server listening on ws://localhost:${PORT}`);
+    console.log(`[Stark Preview Helper] control server listening on ws://${HOST}:${PORT} (loopback only)`);
   });
 }
 
