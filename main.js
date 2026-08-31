@@ -248,6 +248,16 @@ async function launchBrowser() {
     // drops puppeteer's default --disable-extensions.
     ignoreDefaultArgs: ["--enable-automation"], // avoids navigator.webdriver
     // = true and the "controlled by automated software" infobar.
+    // Puppeteer's own default (unset) is a *forced* 800x600 CDP viewport
+    // override, applied on top of whatever size the actual OS window opens
+    // at — the two are independent, so the page content renders confined
+    // to a small 800x600 box in one corner of a normal-sized window,
+    // leaving the rest visibly empty. null turns that override off
+    // entirely, so the page just fills the real window like a normal
+    // browser. --window-size sets that real window to something roomier
+    // than Chrome's own small default for a brand-new profile.
+    defaultViewport: null,
+    args: ["--window-size=1360,860"],
   });
 
   const pages = await browser.pages();
