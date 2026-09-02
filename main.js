@@ -39,6 +39,8 @@ const {
   resolveBuildId,
 } = require("@puppeteer/browsers");
 const { WebSocketServer } = require("ws");
+const selfsigned = require("selfsigned");
+const https = require("node:https");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const os = require("node:os");
@@ -49,6 +51,7 @@ const { pipeline } = require("node:stream/promises");
 const PORT = 17872;
 const CHROME_CACHE_DIR = path.join(os.homedir(), ".cache", "puppeteer");
 const PROFILE_DIR = path.join(os.homedir(), ".stark-preview-chrome-profile");
+const CERT_DIR = path.join(os.homedir(), ".stark-preview-helper-certs");
 
 // Only ever bind the control server to loopback. Without an explicit host,
 // ws/Node listen on :: (ALL interfaces) — which put this port, and every
@@ -59,13 +62,14 @@ const PROFILE_DIR = path.join(os.homedir(), ".stark-preview-chrome-profile");
 // actually keeps remote machines out.
 const HOST = "127.0.0.1";
 
-// Note these are all https:// except localhost, and browsers block an
-// https:// page from opening an insecure ws:// connection — so in practice
-// only http://localhost can reach us today. They're kept for the day the
-// transport moves to wss://, and deliberately exclude wildcard third-party
-// hosting domains: `*.lovable.app` / `*.lovableproject.com` would have
-// trusted EVERY project any stranger deploys on those platforms, not just
-// Stark's own. Stark's Lovable address is a single known host.
+// wss:// (not ws://) since Phase-whatever: browsers block an https:// page
+// from opening an insecure ws:// connection at all (mixed content), which
+// used to mean Preview only ever worked from http://localhost, never the
+// published site. There's no domain to get a normal CA-issued certificate
+// for here, so this is self-signed instead (see ensureCert below) — every
+// browser needs one manual, one-time "trust this" step per machine (visit
+// https://127.0.0.1:17872 once), but nothing gets added to the OS/browser's
+// actual trust store the way installing a local CA (mkcert-style) would.
 const TRUSTED_ORIGIN_PATTERNS = [
   /^http:\/\/localhost(:\d+)?$/,
   /^http:\/\/127\.0\.0\.1(:\d+)?$/,
@@ -336,7 +340,18 @@ async function loadExtension(zipBase64) {
   return { ok: true, extensionId: id, name, hasPopup: !!popupPath };
 }
 
+// Grabs what the user is actually looking at in the preview window, so a
+// build's card can show a real screenshot instead of a generic icon.
+// JPEG (not PNG) keeps the base64 payload small enough to send over the
+// control socket comfortably.
+async function screenshot() {
+  await browserReady;
+  const base64 = await page.screenshot({ type: "jpeg", quality: 70, encoding: "base64" });
+  return { ok: true, imageBase64: base64 };
+}
+
 async function status() {
+
   return {
     ok: true,
     // The website polls this after protocol-booting us: connected-but-not-
@@ -347,6 +362,57 @@ async function status() {
     currentTitle: page ? await page.title().catch(() => null) : null,
     loadedExtensionId: loadedExtension?.id ?? null,
   };
+}
+
+/* --------------------------- TLS cert (self-signed) --------------------------- */
+
+// No domain is involved anywhere in this — the control server only ever
+// needs to be reachable at 127.0.0.1/localhost, on the same machine as the
+// browser. A normal CA (Let's Encrypt etc.) won't issue a certificate for a
+// loopback address at all, so self-signed is the only real option here, not
+// a corner cut. Generated once per machine and cached to disk indefinitely
+// (10-year validity — there's no CA renewal cycle to keep up with since
+// nothing here is publicly trusted); a fresh keypair only ever gets made if
+// the cached one is missing or unreadable.
+async function ensureCert() {
+  const certPath = path.join(CERT_DIR, "cert.pem");
+  const keyPath = path.join(CERT_DIR, "key.pem");
+  try {
+    const [cert, key] = await Promise.all([fs.readFile(certPath, "utf8"), fs.readFile(keyPath, "utf8")]);
+    return { cert, key };
+  } catch {
+    // Missing or unreadable — fall through and generate a fresh one.
+  }
+
+  console.log("[Stark Preview Helper] Generating a local certificate (one-time)...");
+  const notBeforeDate = new Date();
+  const notAfterDate = new Date(notBeforeDate);
+  notAfterDate.setFullYear(notAfterDate.getFullYear() + 10);
+
+  const attrs = [{ name: "commonName", value: "127.0.0.1" }];
+  const pems = await selfsigned.generate(attrs, {
+    keySize: 2048,
+    algorithm: "sha256",
+    notBeforeDate,
+    notAfterDate,
+    extensions: [
+      { name: "basicConstraints", cA: false },
+      { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
+      { name: "extKeyUsage", serverAuth: true },
+      {
+        name: "subjectAltName",
+        altNames: [
+          { type: 7, ip: "127.0.0.1" }, // type 7 = iPAddress
+          { type: 2, value: "localhost" }, // type 2 = dNSName
+        ],
+      },
+    ],
+  });
+
+  await fs.mkdir(CERT_DIR, { recursive: true });
+  await fs.writeFile(certPath, pems.cert, { mode: 0o600 });
+  await fs.writeFile(keyPath, pems.private, { mode: 0o600 });
+  return { cert: pems.cert, key: pems.private };
 }
 
 /* --------------------------- Stark control server --------------------------- */
@@ -361,61 +427,82 @@ function reportControlServerError(err) {
   console.error("[Stark Preview Helper]", message);
 }
 
+// Plain HTTPS response for anything that isn't a WebSocket upgrade — this is
+// the page a person actually sees when they visit https://127.0.0.1:17872
+// directly to get past the browser's self-signed-certificate warning the
+// one time that's needed per machine/browser. Stark's web app opens this in
+// a new tab as part of its setup flow; nothing here is fetched or read by
+// that tab beyond the person clicking through Chrome's own warning.
+function handleHttpRequest(_req, res) {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(
+    "<!doctype html><title>Stark Preview Helper</title>" +
+      "<body style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;" +
+      'display:flex;align-items:center;justify-content:center;height:100vh;margin:0;' +
+      'background:#F4F7FA;color:#0f172a;text-align:center;">' +
+      '<div><h2 style="margin:0 0 8px;">You\'re all set.</h2>' +
+      '<p style="color:#64748b;margin:0;">Stark Preview Helper is trusted on this browser now. ' +
+      "You can close this tab and go back to Stark.</p></div></body>",
+  );
+}
+
 // Resolves once the server is listening; rejects on startup errors such as
 // EADDRINUSE, so main() can tell "another copy is already running" apart
 // from real failures.
-function startControlServer() {
-  return new Promise((resolve, reject) => {
-    let wss;
-    try {
-      wss = new WebSocketServer({ port: PORT, host: HOST });
-    } catch (err) {
-      reject(err);
-      return;
-    }
+async function startControlServer() {
+  const { cert, key } = await ensureCert();
 
-    wss.once("error", (err) => reject(err));
-    wss.on("listening", () => {
-      wss.removeAllListeners("error");
-      wss.on("error", reportControlServerError);
+  return new Promise((resolve, reject) => {
+    const server = https.createServer({ cert, key }, handleHttpRequest);
+    const wss = new WebSocketServer({ server });
+
+    server.once("error", (err) => reject(err));
+    server.on("listening", () => {
+      server.removeAllListeners("error");
+      server.on("error", reportControlServerError);
+      console.log(`[Stark Preview Helper] control server listening on wss://${HOST}:${PORT} (loopback only)`);
       resolve();
     });
 
     wss.on("connection", (ws, req) => {
-    if (!isTrustedOrigin(req.headers.origin)) {
-      ws.close(4001, "Untrusted origin");
-      return;
-    }
-    ws.on("message", async (raw) => {
-      let msg;
-      try {
-        msg = JSON.parse(raw.toString());
-      } catch {
-        ws.send(JSON.stringify({ ok: false, error: "Invalid JSON" }));
+      if (!isTrustedOrigin(req.headers.origin)) {
+        ws.close(4001, "Untrusted origin");
         return;
       }
-      try {
-        let result;
-        switch (msg.type) {
-          case "open":
-            result = await openUrl(msg.url);
-            break;
-          case "loadExtension":
-            result = await loadExtension(msg.zipBase64);
-            break;
-          case "status":
-            result = await status();
-            break;
-          default:
-            result = { ok: false, error: `Unknown command: ${msg.type}` };
+      ws.on("message", async (raw) => {
+        let msg;
+        try {
+          msg = JSON.parse(raw.toString());
+        } catch {
+          ws.send(JSON.stringify({ ok: false, error: "Invalid JSON" }));
+          return;
         }
-        ws.send(JSON.stringify({ id: msg.id, ...result }));
-      } catch (err) {
-        ws.send(JSON.stringify({ id: msg.id, ok: false, error: err?.message || String(err) }));
-      }
+        try {
+          let result;
+          switch (msg.type) {
+            case "open":
+              result = await openUrl(msg.url);
+              break;
+            case "loadExtension":
+              result = await loadExtension(msg.zipBase64);
+              break;
+            case "screenshot":
+              result = await screenshot();
+              break;
+            case "status":
+              result = await status();
+              break;
+            default:
+              result = { ok: false, error: `Unknown command: ${msg.type}` };
+          }
+          ws.send(JSON.stringify({ id: msg.id, ...result }));
+        } catch (err) {
+          ws.send(JSON.stringify({ id: msg.id, ok: false, error: err?.message || String(err) }));
+        }
+      });
     });
-    });
-    console.log(`[Stark Preview Helper] control server listening on ws://${HOST}:${PORT} (loopback only)`);
+
+    server.listen(PORT, HOST);
   });
 }
 

@@ -11,6 +11,7 @@
   "dependencies": {
     "@puppeteer/browsers": "^3.0.6",
     "puppeteer-core": "^25.4.0",
+    "selfsigned": "^5.5.0",
     "ws": "^8.18.0",
     "yauzl": "^2.10.0"
   }
